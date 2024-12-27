@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torch.optim as optim
 from torchvision.transforms import GaussianBlur, Compose, Resize, ToTensor
 from transformers import AutoModelForImageClassification, AutoProcessor
 from torchvision.io import read_image
@@ -9,14 +10,18 @@ import tkinter as tk
 import os
 import numpy as np
 import cv2
-import random
 from io import BytesIO
 from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 model_name = "microsoft/resnet-50"
 model = AutoModelForImageClassification.from_pretrained(model_name)
 processor = AutoProcessor.from_pretrained(model_name)
 
+# Initialize the optimizer
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = torch.nn.CrossEntropyLoss()
 
 def compute_image_entropy(image_tensor):
     """
@@ -71,7 +76,6 @@ def jpeg_compress(image_tensor, quality=75):
     return ToTensor()(compressed_image)
 
 
-
 def predict_image(image_tensor, sanitize=False):
     """
     Predict the class of an image tensor using the ResNet-50 model with optional sanitization.
@@ -122,58 +126,181 @@ def sanitize_input(image_tensor, preserve_details=True):
     return image_tensor
 
 
+def adversarial_training_step(model, inputs, labels, epsilon=0.1):
+    """
+    Perform one step of adversarial training.
+    """
+    pixel_values = inputs["pixel_values"]
+    pixel_values.requires_grad = True  # Allow gradients for FGSM
+
+    # Forward pass to compute logits
+    outputs = model(pixel_values=pixel_values)
+    logits = outputs.logits
+
+    # Compute the loss and gradients
+    loss = criterion(logits, labels)
+    model.zero_grad()
+    loss.backward()
+
+    # Generate adversarial examples using FGSM
+    sign_data_grad = pixel_values.grad.sign()
+    adversarial_tensor = pixel_values + epsilon * sign_data_grad
+    adversarial_tensor = adversarial_tensor.clamp(0, 1)  # Clip the adversarial image to valid range
+
+    # Perform a second forward pass on adversarial example
+    outputs_adv = model(pixel_values=adversarial_tensor)
+    logits_adv = outputs_adv.logits
+    loss_adv = criterion(logits_adv, labels)
+
+    # Combine the losses (clean and adversarial)
+    total_loss = (loss + loss_adv) / 2
+
+    # Backpropagate and update weights
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return total_loss.item()
+
+
+def train_model_with_adversarial_examples(model, dataloader, epochs=5, epsilon=0.1):
+    """
+    Train the model using adversarial training.
+    """
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for batch in dataloader:
+            inputs = batch['input']
+            labels = batch['label']
+
+            # Perform adversarial training step
+            loss = adversarial_training_step(model, inputs, labels, epsilon)
+            running_loss += loss
+
+        print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader)}")
+
+
 def evaluate_defense(image_tensor):
     """
     Evaluate the defense mechanism by predicting original, adversarial, and sanitized images.
+    Return predictions and their probabilities.
     """
-    original_prediction = predict_image(image_tensor)
+    inputs = processor(images=to_pil_image(image_tensor), return_tensors="pt")
+    
+    # Original prediction
+    with torch.no_grad():
+        outputs = model(**inputs)
+    logits = outputs.logits
+    probs = torch.softmax(logits, dim=-1)
+    original_prob, original_class = torch.max(probs, dim=-1)
+    original_label = model.config.id2label[original_class.item()]
 
+    # Adversarial prediction
     adversarial_tensor = generate_adversarial_example(image_tensor)
-    adversarial_prediction = predict_image(adversarial_tensor)
+    adversarial_inputs = processor(images=to_pil_image(adversarial_tensor), return_tensors="pt")
+    with torch.no_grad():
+        outputs_adv = model(**adversarial_inputs)
+    logits_adv = outputs_adv.logits
+    probs_adv = torch.softmax(logits_adv, dim=-1)
+    adv_prob, adv_class = torch.max(probs_adv, dim=-1)
+    adv_label = model.config.id2label[adv_class.item()]
 
-    sanitized_prediction = predict_image(adversarial_tensor, sanitize=True)
+    # Sanitized prediction
+    sanitized_tensor = sanitize_input(adversarial_tensor)
+    sanitized_inputs = processor(images=to_pil_image(sanitized_tensor), return_tensors="pt")
+    with torch.no_grad():
+        outputs_sanitized = model(**sanitized_inputs)
+    logits_sanitized = outputs_sanitized.logits
+    probs_sanitized = torch.softmax(logits_sanitized, dim=-1)
+    sanitized_prob, sanitized_class = torch.max(probs_sanitized, dim=-1)
+    sanitized_label = model.config.id2label[sanitized_class.item()]
 
-    return original_prediction, adversarial_prediction, sanitized_prediction
+    return {
+        "original": {"label": original_label, "probability": original_prob.item()},
+        "adversarial": {"label": adv_label, "probability": adv_prob.item()},
+        "sanitized": {"label": sanitized_label, "probability": sanitized_prob.item()},
+    }
+
+
+
+def update_graph_frame(predictions):
+    """
+    Update the graph frame with a bar chart displaying prediction probabilities and percentage numbers.
+    """
+    # Clear the graph frame
+    for widget in graph_frame.winfo_children():
+        widget.destroy()
+
+    # Prepare data for the bar chart
+    labels = ["Original", "Adversarial", "Sanitized"]
+    probabilities = [
+        predictions["original"]["probability"] * 100,
+        predictions["adversarial"]["probability"] * 100,
+        predictions["sanitized"]["probability"] * 100,
+    ]
+
+    # Create the Matplotlib figure
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars = ax.bar(labels, probabilities, color=["blue", "red", "green"])
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Accuracy Percentage")
+    ax.set_title("Prediction Accuracy")
+
+    # Display percentage labels on top of each bar
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(f'{height:.1f}%',  # Display percentage with 1 decimal place
+                    xy=(bar.get_x() + bar.get_width() / 2, height),  # Position the label at the top of the bar
+                    xytext=(0, 5),  # Offset the label slightly above the bar
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=10, color="black")
+
+    # Embed the Matplotlib figure in the Tkinter frame
+    canvas = FigureCanvasTkAgg(fig, master=graph_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
 
 
 def load_image_from_path(image_path):
-    """Load an image from a path and display predictions for original, adversarial, and sanitized versions."""
+    """Load an image from a path, evaluate predictions, and update the UI."""
     original_image = read_image(image_path)
+    resize_transform = Resize((300, 300))
+    original_image = resize_transform(original_image)
 
-    resize_transform = Resize((300, 300)) 
-  # Create a resize transform
-    original_image = resize_transform(original_image)  
+    # Evaluate defense and update labels
+    predictions = evaluate_defense(original_image)
 
-    # Evaluate defense
-    original_prediction, adversarial_prediction, sanitized_prediction = evaluate_defense(original_image)
+    # Update the graph frame with the new predictions
+    update_graph_frame(predictions)
 
-    # Display the original image and its prediction
+    # Resize and update the images as 300x300
     original_img = ImageTk.PhotoImage(to_pil_image(original_image))
     original_label.config(
         image=original_img,
-        text=f"Original: {original_prediction}",
+        text=f"Original: {predictions['original']['label']}",
         compound=tk.BOTTOM
     )
     original_label.image = original_img
 
-    # Generate and resize the adversarial image
     adversarial_image = generate_adversarial_example(original_image)
-    adversarial_image_resized = resize_transform(adversarial_image) 
+    adversarial_image_resized = resize_transform(adversarial_image)  # Resize adversarial image to 300x300
     adversarial_img = ImageTk.PhotoImage(to_pil_image(adversarial_image_resized))
     adversarial_label.config(
         image=adversarial_img,
-        text=f"Adversarial: {adversarial_prediction}",
+        text=f"Adversarial: {predictions['adversarial']['label']}",
         compound=tk.BOTTOM
     )
     adversarial_label.image = adversarial_img
 
-    # Generate and resize the sanitized image
     sanitized_image = sanitize_input(adversarial_image)
-    sanitized_image_resized = resize_transform(sanitized_image)  # Resize to default size
+    sanitized_image_resized = resize_transform(sanitized_image)  # Resize sanitized image to 300x300
     sanitized_img = ImageTk.PhotoImage(to_pil_image(sanitized_image_resized))
     sanitized_label.config(
         image=sanitized_img,
-        text=f"Sanitized: {sanitized_prediction}",
+        text=f"Sanitized: {predictions['sanitized']['label']}",
         compound=tk.BOTTOM
     )
     sanitized_label.image = sanitized_img
@@ -181,7 +308,7 @@ def load_image_from_path(image_path):
 
 def create_default_image():
     """Create a default background image with a border."""
-    default_image = Image.new("RGB", (300, 300), (179, 225, 187))  
+    default_image = Image.new("RGB", (300, 300), (179, 225, 187))
     draw = ImageDraw.Draw(default_image)
     border_color = "white"
     border_width = 2
@@ -192,7 +319,7 @@ def create_default_image():
     )
     return ImageTk.PhotoImage(default_image)
 
-
+#dataset
 def display_images_from_folder(folder_path):
     """Display images from the folder as clickable thumbnails."""
     # Clear the current thumbnails
@@ -203,50 +330,65 @@ def display_images_from_folder(folder_path):
         if filename.lower().endswith((".png", ".jpg", ".jpeg")):
             image_path = os.path.join(folder_path, filename)
             img = Image.open(image_path)
-            img = img.resize((80, 80))
+            img = img.resize((100, 100))
             img_thumb = ImageTk.PhotoImage(img)
 
             thumbnail_frame = tk.Frame(dataset_frame, bg="#c2f6fa")
-            thumbnail_frame.pack(side=tk.TOP, padx=20, pady=5)
+            thumbnail_frame.pack(side=tk.TOP, padx=20, pady=5, anchor="w")  # Align left for a vertical stack
 
-            button = tk.Button(thumbnail_frame, image=img_thumb, command=lambda path=image_path: load_image_from_path(path), bg="#c2f6fa", borderwidth=0)
+            # Button for the image thumbnail
+            button = tk.Button(
+                thumbnail_frame,
+                image=img_thumb,
+                command=lambda path=image_path: load_image_from_path(path),
+                bg="#c2f6fa",
+                borderwidth=0
+            )
             button.image = img_thumb
-            button.pack()
+            button.grid(row=0, column=0, padx=10)
 
-            label = tk.Label(thumbnail_frame, text=filename, wraplength=100, anchor="center", bg="#c2f6fa")
-            label.pack()
+            # Label for the filename, placed to the right of the button
+            label = tk.Label(
+                thumbnail_frame,
+                text=filename,
+                wraplength=100,
+                anchor="w",  # Left-align the text
+                bg="#c2f6fa"
+            )
+            label.grid(row=0, column=1, padx=10)
+
 
 
 root = tk.Tk()
 root.title("Image Classification")
 root.configure(bg="#e1edf2")
-
-window_width = 1125
-window_height = 500
-screen_width = root.winfo_screenwidth()
-screen_height = root.winfo_screenheight()
-x_cordinate = int((screen_width / 2) - (window_width / 2))
-y_cordinate = int((screen_height / 2) - (window_height / 2))
-root.geometry(f"{window_width}x{window_height}+{x_cordinate}+{y_cordinate}")
+root.attributes("-fullscreen", True)
+root.bind("<Escape>", lambda event: root.attributes("-fullscreen", False))
 
 # Create default background images for all labels
 default_img = create_default_image()
 
 # Original Image label
 original_label = tk.Label(root, text="Original Image", font=("Arial", 10), fg="black", compound=tk.BOTTOM, image=default_img, bg="#60b1ae")
-original_label.pack(side=tk.LEFT, padx=10, pady=10)
+original_label.pack(side=tk.LEFT, anchor="n", padx=10, pady=10)
 
 # Adversarial Image label
 adversarial_label = tk.Label(root, text="Adversarial Image", font=("Arial", 10), fg="black", compound=tk.BOTTOM, image=default_img, bg="#e3a3ac")
-adversarial_label.pack(side=tk.LEFT, padx=10, pady=10)
+adversarial_label.pack(side=tk.LEFT, anchor="n", padx=10, pady=10)
 
 # Sanitized Image label
 sanitized_label = tk.Label(root, text="Sanitized Image", font=("Arial", 10), fg="black", compound=tk.BOTTOM, image=default_img, bg="#89c2ad")
-sanitized_label.pack(side=tk.LEFT, padx=10, pady=10)
+sanitized_label.pack(side=tk.LEFT, anchor="n", padx=10, pady=10)
+
+
+#graph frame
+# Create a frame for the graph
+graph_frame = tk.Frame(root, bg="#c5de6f", relief="groove", bd=2)
+graph_frame.place(relx=0.1, rely=0.5, relwidth=0.5, relheight=0.4)
 
 # Scrollable frame for dataset
 container = tk.Frame(root, bg="#c2f6fa")
-container.pack(side=tk.RIGHT, padx=0, pady=0, fill=tk.BOTH, expand=True)
+container.pack(side=tk.RIGHT, padx=20, pady=0, fill=tk.BOTH, expand=True)
 
 canvas = tk.Canvas(container, bg="#c2f6fa")
 scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview, bg="#c2f6fa")
@@ -275,4 +417,4 @@ def on_mouse_wheel(event):
 
 canvas.bind_all("<MouseWheel>", on_mouse_wheel)
 
-root.mainloop()# new code 12-24-24
+root.mainloop()#12/27/24
